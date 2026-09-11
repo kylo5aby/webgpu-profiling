@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ORT Web WebGPU operator profiler</title>
+    <script>
+      // The ORT WebAssembly build has no file system: Profiler::EndProfiling() streams the Chrome-tracing
+      // JSON to std::cout, which Emscripten forwards to `console.log` -- and it captures `console.log`
+      // by reference at module-evaluation time. So this hook MUST be installed before onnxruntime-web
+      // (and its .mjs glue) is loaded, which is why it lives in a classic inline script in <head>.
+      (function () {
+        const lines = [];
+        window.__ortStdout = lines;
+        const origLog = console.log.bind(console);
+        console.log = function (...args) {
+          if (args.length === 1 && typeof args[0] === 'string') {
+            lines.push(args[0]);
+            return; // keep the DevTools console readable; the driver gets these lines anyway
+          }
+          origLog(...args);
+        };
+      })();
+    </script>
+    <style>
+      body { font: 13px/1.4 ui-monospace, Consolas, monospace; margin: 16px; color: #222; }
+      #status { font-weight: bold; margin-bottom: 8px; }
+      #log { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <div id="status">starting...</div>
+    <div id="log"></div>
+    <script type="module" src="/web/profile.js"></script>
+  </body>
+</html>

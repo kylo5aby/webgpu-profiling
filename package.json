@@ -1,0 +1,19 @@
+{
+  "name": "webgpu-profiling",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Operator-level profiling of ONNX models on WebGPU (Python / native and browser / onnxruntime-web).",
+  "scripts": {
+    "profile-web": "node profile_model_web.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kylo5aby/webgpu-profiling.git"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "onnxruntime-web": "^1.27.0",
+    "puppeteer-core": "^25.10.0"
+  }
+}
