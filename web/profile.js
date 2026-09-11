@@ -8,8 +8,11 @@
 // WebAssembly build it is streamed to std::cout -> console.log, which index.html intercepts into
 // `window.__ortStdout` before this module (and ORT) is loaded.
 
-import * as ort from '/ort/ort.webgpu.min.mjs';
 import { parseNpy, castTensorData, randomTensorData, resolveShape, numElements } from './npy.js';
+
+// onnxruntime-web is imported dynamically from the entry chosen by the driver (--ort-dist /
+// --ort-entry), so a custom build (e.g. JSPI) can be swapped in without touching this file.
+let ort;
 
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
@@ -108,6 +111,15 @@ function offerDownload(text, filename) {
 
 async function main() {
   const cfg = await (await fetch('/config.json')).json();
+
+  setStatus(`loading onnxruntime-web from ${cfg.ortEntryUrl} ...`);
+  ort = await import(cfg.ortEntryUrl);
+  if (/jspi/i.test(cfg.ortEntryUrl) && typeof WebAssembly.Suspending !== 'function') {
+    throw new Error(
+      'This onnxruntime-web build needs WebAssembly JSPI, which this browser does not expose. ' +
+        'Use Chrome >= 137 or launch with --chrome-arg=--enable-experimental-webassembly-jspi.',
+    );
+  }
 
   ort.env.wasm.wasmPaths = '/ort/';
   ort.env.wasm.proxy = false; // stdout must come from this thread so the console hook sees it

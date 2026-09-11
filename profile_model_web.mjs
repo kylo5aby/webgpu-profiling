@@ -29,7 +29,8 @@ import puppeteer from 'puppeteer-core';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(HERE, 'web');
-const ORT_DIST = path.join(HERE, 'node_modules', 'onnxruntime-web', 'dist');
+const DEFAULT_ORT_DIST = path.join(HERE, 'node_modules', 'onnxruntime-web', 'dist');
+const DEFAULT_ORT_ENTRY = 'ort.webgpu.min.mjs';
 const OUTPUT_DIR = path.join(HERE, 'outputs');
 
 // ---------------------------------------------------------------------------------------------
@@ -51,6 +52,12 @@ Options:
   --external-data PATH    Extra external-data file for the model (repeatable). Files named
                           <model>.data / <model>_data / <stem>.data / <stem>_data / <stem>.onnx.data
                           next to the model are picked up automatically.
+  --ort-dist DIR          Directory with the onnxruntime-web build to use (the .mjs entry, the
+                          ort-wasm-simd-threaded.*.mjs glue and the .wasm). Default:
+                          node_modules/onnxruntime-web/dist. Point it at js/web/dist of your
+                          own build to profile a custom (e.g. JSPI) onnxruntime-web.
+  --ort-entry FILE        ES-module entry inside --ort-dist (default ort.webgpu.min.mjs; use
+                          ort.jspi.min.mjs / ort.jspi.bundle.min.mjs for the JSPI build).
   --layout NHWC|NCHW      WebGPU EP preferredLayout. Default: leave it to ORT (matches Python).
   --threads N             ort.env.wasm.numThreads (default: ORT decides).
   --log-level LEVEL       ort.env.logLevel: verbose|info|warning|error|fatal (default warning).
@@ -76,6 +83,8 @@ function parseCli(argv) {
       output: { type: 'string', short: 'o', default: 'model_prof_web.json' },
       input: { type: 'string', multiple: true, default: [] },
       'external-data': { type: 'string', multiple: true, default: [] },
+      'ort-dist': { type: 'string', default: DEFAULT_ORT_DIST },
+      'ort-entry': { type: 'string', default: DEFAULT_ORT_ENTRY },
       layout: { type: 'string' },
       threads: { type: 'string' },
       'log-level': { type: 'string', default: 'warning' },
@@ -118,6 +127,8 @@ function parseCli(argv) {
     output: values.output,
     inputBindings,
     externalData: values['external-data'].map((p) => path.resolve(p)),
+    ortDist: path.resolve(values['ort-dist']),
+    ortEntry: values['ort-entry'],
     layout: values.layout,
     threads: values.threads ? intArg('threads', values.threads) : undefined,
     logLevel: values['log-level'],
@@ -207,7 +218,7 @@ function serveFromDir(res, dir, rel) {
   sendFile(res, abs);
 }
 
-function startServer({ port, config, modelFiles, inputFiles }) {
+function startServer({ port, config, modelFiles, inputFiles, ortDist }) {
   const server = http.createServer((req, res) => {
     // Cross-origin isolation is required for SharedArrayBuffer (multi-threaded WASM).
     res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -226,7 +237,7 @@ function startServer({ port, config, modelFiles, inputFiles }) {
       return res.end(body);
     }
     if (p.startsWith('/web/')) return serveFromDir(res, WEB_DIR, p.slice('/web/'.length));
-    if (p.startsWith('/ort/')) return serveFromDir(res, ORT_DIST, p.slice('/ort/'.length));
+    if (p.startsWith('/ort/')) return serveFromDir(res, ortDist, p.slice('/ort/'.length));
     if (p.startsWith('/model/')) {
       const abs = modelFiles.get(p.slice('/model/'.length));
       if (abs) return sendFile(res, abs);
@@ -325,6 +336,11 @@ async function main() {
   const { files: modelFiles, external } = collectModelFiles(args.model, args.externalData);
   const modelName = path.basename(args.model);
 
+  const ortEntryPath = path.join(args.ortDist, args.ortEntry);
+  if (!fs.existsSync(ortEntryPath)) {
+    throw new Error(`onnxruntime-web entry not found: ${ortEntryPath} (check --ort-dist / --ort-entry)`);
+  }
+
   const inputFiles = new Map();
   for (const [name, p] of Object.entries(args.inputBindings)) {
     if (!fs.existsSync(p)) throw new Error(`--input ${name}: file not found: ${p}`);
@@ -332,6 +348,7 @@ async function main() {
   }
 
   const config = {
+    ortEntryUrl: `/ort/${encodeURIComponent(args.ortEntry)}`,
     modelUrl: `/model/${encodeURIComponent(modelName)}`,
     externalData: external.map((name) => ({ path: name, data: `/model/${encodeURIComponent(name)}` })),
     inputs: Object.fromEntries([...inputFiles.keys()].map((n) => [n, `/input/${encodeURIComponent(n)}`])),
@@ -343,8 +360,9 @@ async function main() {
     outputName: args.output,
   };
 
-  const { server, port } = await startServer({ port: args.port, config, modelFiles, inputFiles });
+  const { server, port } = await startServer({ port: args.port, config, modelFiles, inputFiles, ortDist: args.ortDist });
   const url = `http://127.0.0.1:${port}/`;
+  console.log(`ORT   : ${ortEntryPath}`);
   console.log(`Model : ${args.model}${external.length ? `  (+ external data: ${external.join(', ')})` : ''}`);
   for (const [name, p] of inputFiles) console.log(`Input : ${name} <- ${p}`);
   console.log(`Server: ${url}`);
