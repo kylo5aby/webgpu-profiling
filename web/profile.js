@@ -2,7 +2,8 @@
 //
 // Mirrors profile_model.py: create an onnxruntime-web session on the WebGPU EP with profiling
 // enabled, build feeds (real .npy tensors or scaled-random data), run N measured iterations,
-// call endProfiling() and hand the ORT Chrome-tracing JSON back to the Node driver.
+// call endProfiling() and POST the ORT Chrome-tracing JSON back to the local server, which
+// writes it to outputs/.
 //
 // The JSON itself is produced by the same C++ Profiler as in the native/Python build. In the
 // WebAssembly build it is streamed to std::cout -> console.log, which index.html intercepts into
@@ -10,15 +11,17 @@
 
 import { parseNpy, castTensorData, randomTensorData, resolveShape, numElements } from './npy.js';
 
-// onnxruntime-web is imported dynamically from the entry chosen by the driver (--ort-dist /
+// onnxruntime-web is imported dynamically from the entry chosen by the server (--ort-dist /
 // --ort-entry), so a custom build (e.g. JSPI) can be swapped in without touching this file.
 let ort;
 
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
-const hasDriver = typeof window.__report === 'function';
 
-const report = (kind, payload) => (hasDriver ? window.__report(kind, payload) : Promise.resolve());
+// Fire-and-forget progress line for the server console.
+function report(kind, body) {
+  return fetch(`/report/${kind}`, { method: 'POST', body, keepalive: true }).catch(() => {});
+}
 
 function log(msg) {
   logEl.textContent += msg + '\n';
@@ -89,13 +92,18 @@ function collectProfileLines() {
   return window.__ortStdout.filter((l) => l === '[' || l === ']' || l.startsWith('{"cat"'));
 }
 
-async function sendProfile(lines) {
-  const CHUNK = 1 << 20; // ~1 MB per message keeps CDP payloads small
-  const text = lines.join('\n') + '\n';
-  for (let off = 0; off < text.length; off += CHUNK) {
-    await report('profile-chunk', text.slice(off, off + CHUNK));
+/** Upload the finished profile; resolves true if the server accepted it. */
+async function sendResult(text, summary) {
+  try {
+    const resp = await fetch('/report/done', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ summary, profile: text }),
+    });
+    return resp.ok;
+  } catch {
+    return false;
   }
-  return text;
 }
 
 function offerDownload(text, filename) {
@@ -186,19 +194,24 @@ async function main() {
     throw new Error('No profiler output captured. Was the console.log hook installed before ORT loaded?');
   }
 
-  setStatus(hasDriver ? 'sending profile to driver ...' : 'preparing download ...');
-  const text = await sendProfile(lines);
   await session.release();
-
+  const text = lines.join('\n') + '\n';
   const summary = { wallMsPerRun, iters: cfg.iters, warmup: cfg.warmup || 0, adapter, ortVersion: ort.env.versions.web };
-  if (!hasDriver) offerDownload(text, cfg.outputName || 'model_prof_web.json');
-  setStatus('done');
-  await report('done', summary);
+
+  setStatus('uploading profile to the server ...');
+  const outputName = cfg.outputName || 'model_prof_web.json';
+  if (await sendResult(text, summary)) {
+    setStatus(`done -- profile written to outputs/${outputName}; you can close this tab`);
+  } else {
+    // Server gone (already exited / stopped)? Still let the user save the file.
+    offerDownload(text, outputName);
+    setStatus('done -- the server did not accept the upload; use the download link below');
+  }
 }
 
 main().catch(async (e) => {
   const msg = e && e.stack ? e.stack : String(e);
-  setStatus(`ERROR: ${e && e.message ? e.message : e}`);
+  statusEl.textContent = `ERROR: ${e && e.message ? e.message : e}`;
   logEl.textContent += msg + '\n';
   await report('error', msg);
 });

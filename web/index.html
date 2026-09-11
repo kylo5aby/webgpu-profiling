@@ -15,7 +15,7 @@
         console.log = function (...args) {
           if (args.length === 1 && typeof args[0] === 'string') {
             lines.push(args[0]);
-            return; // keep the DevTools console readable; the driver gets these lines anyway
+            return; // keep the DevTools console readable; these lines are uploaded to the server anyway
           }
           origLog(...args);
         };

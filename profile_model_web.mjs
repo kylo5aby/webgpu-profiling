@@ -1,31 +1,29 @@
 #!/usr/bin/env node
 /**
  * Browser counterpart of profile_model.py: operator-level profiling of an ONNX model with
- * onnxruntime-web on the WebGPU EP, *inside a real Chromium browser*.
+ * onnxruntime-web on the WebGPU EP, inside whatever browser you choose to open the URL in.
  *
- * It starts a local static server (page, onnxruntime-web dist, model, .npy inputs), launches
- * Chrome/Edge through puppeteer-core with the WebGPU flags, and the page (web/profile.js) creates
- * the session with `enableProfiling`, runs N iterations and calls endProfiling(). In the WASM
- * build ORT's C++ Profiler writes the Chrome-tracing JSON to stdout -> console.log; the page
- * intercepts those lines and streams them back here, where they are written verbatim to
- * outputs/<name>.json in exactly the same format as the Python/native run.
+ * This script only runs a local HTTP server. It serves the page (web/), the onnxruntime-web
+ * build, the model and the .npy inputs, prints a URL, and waits. Open that URL in the browser
+ * you want to measure. The page (web/profile.js) creates the session with `enableProfiling`,
+ * runs N iterations and calls endProfiling(). In the WASM build ORT's C++ Profiler writes the
+ * Chrome-tracing JSON to stdout -> console.log; the page intercepts those lines and POSTs them
+ * back here, where they are written verbatim to outputs/<name>.json -- the same format as the
+ * Python/native run. The server exits once a result (or an error) has been received.
  *
  * Usage:
  *   node profile_model_web.mjs Z-Image-Turbo-webnn/onnx/vae_decoder_model_f16.onnx \
- *       --input latent_sample=real_latent.npy --iters 20 -o vae_decoder_prof_web.json
+ *       --input latent_sample=real_latent.npy --iters 20 -o vae_decoder_prof_web.json \
+ *       --ort-dist /path/to/onnxruntime/js/web/dist --ort-entry ort.jspi.min.mjs
  *
- *   node profile_model_web.mjs model.onnx --serve-only     # open the printed URL yourself
+ * No npm dependencies are required when --ort-dist points at your own onnxruntime-web build.
  */
 
 import fs from 'node:fs';
 import http from 'node:http';
-import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-
-import puppeteer from 'puppeteer-core';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.join(HERE, 'web');
@@ -39,8 +37,9 @@ const OUTPUT_DIR = path.join(HERE, 'outputs');
 
 const HELP = `Usage: node profile_model_web.mjs MODEL.onnx [options]
 
-Profile an ONNX model's operators with onnxruntime-web (WebGPU EP) in a real browser and write
-the ORT Chrome-tracing JSON to outputs/.
+Start a local server for profiling an ONNX model's operators with onnxruntime-web (WebGPU EP).
+Open the printed URL in the browser you want to measure; the ORT Chrome-tracing JSON is written
+to outputs/ when the page finishes, and the server exits.
 
 Options:
   --iters N               Measured runs (default 20). All of them are in the profile.
@@ -61,16 +60,20 @@ Options:
   --layout NHWC|NCHW      WebGPU EP preferredLayout. Default: leave it to ORT (matches Python).
   --threads N             ort.env.wasm.numThreads (default: ORT decides).
   --log-level LEVEL       ort.env.logLevel: verbose|info|warning|error|fatal (default warning).
-  --browser PATH          Chrome/Chromium/Edge executable (default: auto-detect, or $CHROME_PATH).
-  --chrome-arg ARG        Extra Chromium command-line switch (repeatable).
-  --headless              Run the browser headless. WebGPU in headless mode may fall back to a
-                          software adapter on some platforms; default is a visible window.
-  --port N                Local server port (default: random free port).
-  --timeout MIN           Abort if the run takes longer than MIN minutes (default 0 = no limit).
-  --keep-open             Leave the browser open after finishing (or failing) for inspection.
-  --serve-only            Only start the server and print the URL; open it in any browser
-                          yourself. The page then offers the JSON as a download.
+  --port N                Local server port (default 8787; 0 = random free port).
+  --timeout MIN           Exit with an error if no result arrives within MIN minutes (default 0
+                          = wait forever).
+  --keep-serving          Do not exit after the first result; every page load re-runs the
+                          profile and overwrites the output. Ctrl+C to stop.
   -h, --help              Show this help.
+
+Browser tips:
+  * WebGPU needs a secure context; http://127.0.0.1 qualifies, so any Chromium-based browser on
+    this machine works. Just open the URL there.
+  * For sub-100us GPU timings enable chrome://flags/#enable-webgpu-developer-features (or start
+    the browser with --enable-webgpu-developer-features); otherwise Chrome quantizes the
+    timestamp-query values used for the "Api" events to 100 us.
+  * A JSPI build needs Chrome >= 137 (or chrome://flags/#enable-experimental-webassembly-jspi).
 `;
 
 function parseCli(argv) {
@@ -88,13 +91,9 @@ function parseCli(argv) {
       layout: { type: 'string' },
       threads: { type: 'string' },
       'log-level': { type: 'string', default: 'warning' },
-      browser: { type: 'string' },
-      'chrome-arg': { type: 'string', multiple: true, default: [] },
-      headless: { type: 'boolean', default: false },
-      port: { type: 'string', default: '0' },
+      port: { type: 'string', default: '8787' },
       timeout: { type: 'string', default: '0' },
-      'keep-open': { type: 'boolean', default: false },
-      'serve-only': { type: 'boolean', default: false },
+      'keep-serving': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   });
@@ -132,13 +131,9 @@ function parseCli(argv) {
     layout: values.layout,
     threads: values.threads ? intArg('threads', values.threads) : undefined,
     logLevel: values['log-level'],
-    browser: values.browser,
-    chromeArgs: values['chrome-arg'],
-    headless: values.headless,
     port: intArg('port', values.port),
     timeoutMin: intArg('timeout', values.timeout),
-    keepOpen: values['keep-open'],
-    serveOnly: values['serve-only'],
+    keepServing: values['keep-serving'],
   };
 }
 
@@ -174,7 +169,7 @@ function collectModelFiles(modelPath, explicitExternal) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Static server
+// HTTP helpers
 // ---------------------------------------------------------------------------------------------
 
 const MIME = {
@@ -186,20 +181,19 @@ const MIME = {
   '.map': 'application/json; charset=utf-8',
 };
 
+function sendStatus(res, code, text = '') {
+  res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end(text);
+}
+
 function sendFile(res, absPath) {
   let stat;
   try {
     stat = fs.statSync(absPath);
   } catch {
-    res.writeHead(404);
-    res.end('not found');
-    return;
+    return sendStatus(res, 404, 'not found');
   }
-  if (!stat.isFile()) {
-    res.writeHead(404);
-    res.end('not found');
-    return;
-  }
+  if (!stat.isFile()) return sendStatus(res, 404, 'not found');
   res.writeHead(200, {
     'Content-Type': MIME[path.extname(absPath).toLowerCase()] || 'application/octet-stream',
     'Content-Length': stat.size,
@@ -210,109 +204,17 @@ function sendFile(res, absPath) {
 
 function serveFromDir(res, dir, rel) {
   const abs = path.resolve(dir, rel);
-  if (!abs.startsWith(path.resolve(dir) + path.sep)) {
-    res.writeHead(403);
-    res.end('forbidden');
-    return;
-  }
+  if (!abs.startsWith(path.resolve(dir) + path.sep)) return sendStatus(res, 403, 'forbidden');
   sendFile(res, abs);
 }
 
-function startServer({ port, config, modelFiles, inputFiles, ortDist }) {
-  const server = http.createServer((req, res) => {
-    // Cross-origin isolation is required for SharedArrayBuffer (multi-threaded WASM).
-    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
-
-    const url = new URL(req.url, 'http://localhost');
-    const p = decodeURIComponent(url.pathname);
-    if (p === '/' || p === '/index.html') return sendFile(res, path.join(WEB_DIR, 'index.html'));
-    if (p === '/favicon.ico') {
-      res.writeHead(204);
-      return res.end();
-    }
-    if (p === '/config.json') {
-      const body = JSON.stringify(config);
-      res.writeHead(200, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
-      return res.end(body);
-    }
-    if (p.startsWith('/web/')) return serveFromDir(res, WEB_DIR, p.slice('/web/'.length));
-    if (p.startsWith('/ort/')) return serveFromDir(res, ortDist, p.slice('/ort/'.length));
-    if (p.startsWith('/model/')) {
-      const abs = modelFiles.get(p.slice('/model/'.length));
-      if (abs) return sendFile(res, abs);
-    }
-    if (p.startsWith('/input/')) {
-      const abs = inputFiles.get(p.slice('/input/'.length));
-      if (abs) return sendFile(res, abs);
-    }
-    res.writeHead(404);
-    res.end('not found');
-  });
+function readBody(req) {
   return new Promise((resolve, reject) => {
-    server.on('error', reject);
-    server.listen(port, '127.0.0.1', () => resolve({ server, port: server.address().port }));
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
   });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Browser
-// ---------------------------------------------------------------------------------------------
-
-function findBrowser(explicit) {
-  const candidates = [];
-  if (explicit) candidates.push(explicit);
-  if (process.env.CHROME_PATH) candidates.push(process.env.CHROME_PATH);
-  if (process.platform === 'win32') {
-    const pf = process.env['ProgramFiles'] || 'C:\\Program Files';
-    const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
-    const local = process.env.LOCALAPPDATA || '';
-    candidates.push(
-      path.join(pf, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(pf86, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(local, 'Google', 'Chrome', 'Application', 'chrome.exe'),
-      path.join(local, 'Google', 'Chrome SxS', 'Application', 'chrome.exe'), // Canary
-      path.join(pf, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-      path.join(pf86, 'Microsoft', 'Edge', 'Application', 'msedge.exe'),
-    );
-  } else if (process.platform === 'darwin') {
-    candidates.push(
-      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-      '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
-      '/Applications/Chromium.app/Contents/MacOS/Chromium',
-      '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-    );
-  } else {
-    for (const name of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'microsoft-edge']) {
-      try {
-        candidates.push(execFileSync('which', [name], { encoding: 'utf8' }).trim());
-      } catch {
-        /* not installed */
-      }
-    }
-  }
-  const found = candidates.find((c) => c && fs.existsSync(c));
-  if (!found) {
-    throw new Error(
-      'No Chrome/Chromium/Edge found. Pass --browser PATH or set CHROME_PATH.\n  Tried:\n  ' + candidates.join('\n  '),
-    );
-  }
-  return found;
-}
-
-function chromeArgs(extra) {
-  const args = [
-    '--enable-unsafe-webgpu',
-    // Unquantized timestamp queries; without it Chrome rounds GPU timestamps to 100us.
-    '--enable-webgpu-developer-features',
-    '--enable-dawn-features=allow_unsafe_apis',
-    '--ignore-gpu-blocklist',
-    '--no-first-run',
-    '--no-default-browser-check',
-    '--window-size=1100,800',
-  ];
-  if (process.platform === 'linux') args.push('--enable-features=Vulkan');
-  return args.concat(extra);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -324,6 +226,28 @@ function summarizeProfile(text) {
   const byCat = {};
   for (const ev of events) byCat[ev.cat] = (byCat[ev.cat] || 0) + 1;
   return { count: events.length, byCat };
+}
+
+function writeResult(outputName, text, summary) {
+  const stats = summarizeProfile(text);
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+  const outPath = path.join(OUTPUT_DIR, outputName);
+  fs.writeFileSync(outPath, text);
+
+  console.log(`Wall-clock per run: ${summary.wallMsPerRun.toFixed(2)} ms`);
+  console.log(
+    `Profile events: ${stats.count} (${Object.entries(stats.byCat)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(', ')})`,
+  );
+  if (!stats.byCat.Api) {
+    console.warn(
+      'WARNING: no "Api" (GPU timestamp) events in the profile. The WebGPU device did not get ' +
+        '"timestamp-query"; check the adapter features printed above.',
+    );
+  }
+  console.log(`Profile written to: ${outPath}`);
+  return outPath;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -360,114 +284,116 @@ async function main() {
     outputName: args.output,
   };
 
-  const { server, port } = await startServer({ port: args.port, config, modelFiles, inputFiles, ortDist: args.ortDist });
-  const url = `http://127.0.0.1:${port}/`;
+  // The process ends on the first /report/done or /report/error (unless --keep-serving),
+  // on --timeout, or on Ctrl+C.
+  let resolveExit;
+  const exitCodePromise = new Promise((resolve) => {
+    resolveExit = resolve;
+  });
+  const onResult = (code) => {
+    if (args.keepServing) {
+      console.log('Still serving; reload the page to run again (Ctrl+C to stop).');
+      return;
+    }
+    resolveExit(code);
+  };
+
+  const server = http.createServer(async (req, res) => {
+    // Cross-origin isolation is required for SharedArrayBuffer (multi-threaded WASM).
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+
+    const url = new URL(req.url, 'http://localhost');
+    const p = decodeURIComponent(url.pathname);
+
+    try {
+      if (req.method === 'POST' && p.startsWith('/report/')) {
+        const kind = p.slice('/report/'.length);
+        const body = await readBody(req);
+        switch (kind) {
+          case 'log':
+            console.log(body);
+            break;
+          case 'done': {
+            const { summary, profile } = JSON.parse(body);
+            try {
+              writeResult(args.output, profile, summary);
+              onResult(0);
+            } catch (e) {
+              console.error(`ERROR: invalid profile received: ${e.message}`);
+              onResult(1);
+            }
+            break;
+          }
+          case 'error':
+            console.error(`ERROR: page reported an error:\n${body}`);
+            onResult(1);
+            break;
+          default:
+            return sendStatus(res, 404, 'unknown report kind');
+        }
+        return sendStatus(res, 204);
+      }
+
+      if (req.method !== 'GET' && req.method !== 'HEAD') return sendStatus(res, 405, 'method not allowed');
+      if (p === '/' || p === '/index.html') return sendFile(res, path.join(WEB_DIR, 'index.html'));
+      if (p === '/favicon.ico') return sendStatus(res, 204);
+      if (p === '/config.json') {
+        res.writeHead(200, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
+        return res.end(JSON.stringify(config));
+      }
+      if (p.startsWith('/web/')) return serveFromDir(res, WEB_DIR, p.slice('/web/'.length));
+      if (p.startsWith('/ort/')) return serveFromDir(res, args.ortDist, p.slice('/ort/'.length));
+      if (p.startsWith('/model/')) {
+        const abs = modelFiles.get(p.slice('/model/'.length));
+        if (abs) return sendFile(res, abs);
+      }
+      if (p.startsWith('/input/')) {
+        const abs = inputFiles.get(p.slice('/input/'.length));
+        if (abs) return sendFile(res, abs);
+      }
+      sendStatus(res, 404, 'not found');
+    } catch (e) {
+      console.error(`ERROR handling ${req.method} ${p}: ${e.message}`);
+      sendStatus(res, 500, e.message);
+    }
+  });
+
+  await new Promise((resolve, reject) => {
+    server.on('error', reject);
+    server.listen(args.port, '127.0.0.1', resolve);
+  });
+  const url = `http://127.0.0.1:${server.address().port}/`;
+
   console.log(`ORT   : ${ortEntryPath}`);
   console.log(`Model : ${args.model}${external.length ? `  (+ external data: ${external.join(', ')})` : ''}`);
   for (const [name, p] of inputFiles) console.log(`Input : ${name} <- ${p}`);
-  console.log(`Server: ${url}`);
+  console.log(`Output: ${path.join(OUTPUT_DIR, args.output)}`);
+  console.log('');
+  console.log(`Open this URL in the browser you want to profile:\n\n    ${url}\n`);
+  console.log(
+    args.keepServing
+      ? 'Waiting for results (--keep-serving: every page load re-runs the profile; Ctrl+C to stop) ...'
+      : 'Waiting for the page to finish (Ctrl+C to abort) ...',
+  );
 
-  if (args.serveOnly) {
-    console.log('Serve-only mode: open the URL above in a WebGPU-capable browser; Ctrl+C to stop.');
-    await new Promise((resolve) => process.once('SIGINT', resolve));
-    server.close();
-    return;
+  if (args.timeoutMin > 0) {
+    setTimeout(() => {
+      console.error(`ERROR: no result within ${args.timeoutMin} minutes.`);
+      resolveExit(1);
+    }, args.timeoutMin * 60_000).unref();
   }
-
-  const executablePath = findBrowser(args.browser);
-  console.log(`Browser: ${executablePath}${args.headless ? ' (headless)' : ''}`);
-  const browser = await puppeteer.launch({
-    executablePath,
-    headless: args.headless,
-    args: chromeArgs(args.chromeArgs),
-    ignoreDefaultArgs: ['--disable-gpu'],
-    protocolTimeout: 2 ** 31 - 1, // page work can take many minutes; never let CDP time out
+  process.once('SIGINT', () => {
+    console.log('\nInterrupted.');
+    resolveExit(130);
   });
 
-  const chunks = [];
-  let finished = false;
-  const outcome = new Promise((resolve, reject) => {
-    const fail = (e) => {
-      if (!finished) {
-        finished = true;
-        reject(e instanceof Error ? e : new Error(String(e)));
-      }
-    };
-    browser.on('disconnected', () =>
-      fail('Browser disconnected before the run finished (GPU process crash / device lost / window closed?).'),
-    );
-    if (args.timeoutMin > 0) {
-      setTimeout(() => fail(`Timed out after ${args.timeoutMin} minutes.`), args.timeoutMin * 60_000).unref();
-    }
-
-    (async () => {
-      const page = await browser.newPage();
-      page.on('pageerror', (e) => console.error(`[page error] ${e.message}`));
-      page.on('console', (msg) => {
-        const t = msg.type();
-        if (t === 'error' || t === 'warning') console.error(`[browser ${t}] ${msg.text()}`);
-      });
-      await page.exposeFunction('__report', (kind, payload) => {
-        switch (kind) {
-          case 'log':
-            console.log(payload);
-            break;
-          case 'profile-chunk':
-            chunks.push(payload);
-            break;
-          case 'done':
-            if (!finished) {
-              finished = true;
-              resolve(payload);
-            }
-            break;
-          case 'error':
-            fail(`Page reported an error:\n${payload}`);
-            break;
-          default:
-            console.warn(`unknown report kind: ${kind}`);
-        }
-      });
-      await page.goto(url, { waitUntil: 'load' });
-    })().catch(fail);
-  });
-
-  let exitCode = 0;
-  try {
-    const summary = await outcome;
-    const text = chunks.join('');
-    const stats = summarizeProfile(text);
-
-    fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-    const outPath = path.join(OUTPUT_DIR, args.output);
-    fs.writeFileSync(outPath, text);
-
-    console.log(`Wall-clock per run: ${summary.wallMsPerRun.toFixed(2)} ms`);
-    console.log(
-      `Profile events: ${stats.count} (${Object.entries(stats.byCat)
-        .map(([k, v]) => `${k}=${v}`)
-        .join(', ')})`,
-    );
-    if (!stats.byCat.Api) {
-      console.warn(
-        'WARNING: no "Api" (GPU timestamp) events in the profile. The WebGPU device did not get ' +
-          '"timestamp-query"; check the adapter features printed above and the Chrome flags.',
-      );
-    }
-    console.log(`Profile written to: ${outPath}`);
-  } catch (e) {
-    exitCode = 1;
-    console.error(`ERROR: ${e.message}`);
-  } finally {
-    if (args.keepOpen && browser.connected) {
-      console.log('--keep-open: browser left running; close the window to exit.');
-      await new Promise((resolve) => browser.once('disconnected', resolve));
-    } else if (browser.connected) {
-      await browser.close().catch(() => {});
-    }
-    server.close();
-  }
-  process.exit(exitCode);
+  const exitCode = await exitCodePromise;
+  process.exitCode = exitCode;
+  server.close();
+  // Give the in-flight 204 response a moment to flush, then exit even if a keep-alive
+  // connection from the browser is still open.
+  setTimeout(() => process.exit(exitCode), 200);
 }
 
 main().catch((e) => {

@@ -12,9 +12,6 @@
     "url": "git+https://github.com/kylo5aby/webgpu-profiling.git"
   },
   "license": "ISC",
-  "dependencies": {
-    "puppeteer-core": "^25.10.0"
-  },
   "optionalDependencies": {
     "onnxruntime-web": "^1.27.0"
   }
